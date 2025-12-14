@@ -221,6 +221,134 @@ app.get('/api/email-logs', async (req, res) => {
 });
 
 // =========================================================
+// FOLLOW-UPS - People emailed but not in leads (didn't reply)
+// =========================================================
+
+app.get('/api/follow-ups', async (req, res) => {
+  try {
+    // Get all emails from leads table (people who replied)
+    const { data: leads } = await supabase.from('leads').select('email');
+    const repliedEmails = new Set((leads || []).map(l => l.email?.toLowerCase()).filter(Boolean));
+    
+    // Get unique contacts from email_log, grouped by email with latest sent date
+    const { data: emailLogs } = await supabase
+      .from('email_log')
+      .select('*')
+      .order('sent_at', { ascending: false });
+    
+    // Group by email, keep the most recent entry and count total emails
+    const emailMap = new Map();
+    for (const log of (emailLogs || [])) {
+      const email = log.email?.toLowerCase();
+      if (!email || repliedEmails.has(email)) continue;
+      
+      if (!emailMap.has(email)) {
+        emailMap.set(email, { ...log, email_count: 1 });
+      } else {
+        emailMap.get(email).email_count++;
+      }
+    }
+    
+    const unreplied = Array.from(emailMap.values());
+    res.json(unreplied);
+  } catch (err) {
+    console.error('Follow-ups error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Send follow-up emails to all unreplied contacts
+app.post('/api/send-follow-ups', async (req, res) => {
+  const { yourName, yourCompany, yourPhone } = req.body;
+  
+  const config = {
+    yourName: yourName || 'Dylan Bennett',
+    yourCompany: yourCompany || 'ABC Real Estate',
+    yourPhone: yourPhone || '(302) 922-4238'
+  };
+
+  try {
+    // Get unreplied contacts
+    const { data: leads } = await supabase.from('leads').select('email');
+    const repliedEmails = new Set((leads || []).map(l => l.email?.toLowerCase()).filter(Boolean));
+    
+    const { data: emailLogs } = await supabase
+      .from('email_log')
+      .select('*')
+      .order('sent_at', { ascending: false });
+    
+    const emailMap = new Map();
+    for (const log of (emailLogs || [])) {
+      const email = log.email?.toLowerCase();
+      if (!email || repliedEmails.has(email)) continue;
+      if (!emailMap.has(email)) {
+        emailMap.set(email, log);
+      }
+    }
+    
+    const unreplied = Array.from(emailMap.values());
+    let sent = 0, failed = 0;
+
+    for (const contact of unreplied) {
+      if (!contact.email) { failed++; continue; }
+
+      const template = EMAIL_TEMPLATES[contact.type] || EMAIL_TEMPLATES.outofstate;
+      const firstName = contact.name?.split(' ')[0] || 'there';
+      
+      // Follow-up subject line
+      const followUpSubject = `Following up: ${template.subject}`;
+      
+      try {
+        const { error } = await resend.emails.send({
+          from: `${config.yourName} <onboarding@resend.dev>`,
+          to: contact.email,
+          subject: followUpSubject,
+          text: `Hi ${firstName},
+
+I wanted to follow up on my previous message about your property at ${contact.address || 'your property'}.
+
+I understand you're busy, but if your situation has changed or you'd like to explore your options, I'm here to help.
+
+No pressure at all - just let me know if you'd like to chat.
+
+Best regards,
+${config.yourName}
+${config.yourCompany}
+${config.yourPhone}`
+        });
+
+        if (error) {
+          console.error('Follow-up error:', contact.email, error);
+          failed++;
+        } else {
+          sent++;
+          await supabase.from('email_log').insert({
+            email: contact.email,
+            name: contact.name,
+            address: contact.address,
+            type: contact.type,
+            subject: followUpSubject,
+            sent_at: new Date().toISOString(),
+            status: 'follow-up'
+          });
+        }
+      } catch (err) {
+        console.error('Send error:', contact.email, err);
+        failed++;
+      }
+
+      await new Promise(r => setTimeout(r, 500)); // Rate limit
+    }
+
+    console.log(`Follow-ups: ${sent} sent, ${failed} failed`);
+    res.json({ success: true, sent, failed });
+  } catch (err) {
+    console.error('Follow-up batch error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// =========================================================
 // SEND EMAIL TO EXISTING LEAD (in database)
 // =========================================================
 
