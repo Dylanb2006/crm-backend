@@ -6,13 +6,12 @@ require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
-const nodemailer = require('nodemailer');
+const { Resend } = require('resend');
 const { createClient } = require('@supabase/supabase-js');
 const cron = require('node-cron');
 
 // Load credentials from environment variables
-const GMAIL_USER = process.env.EMAIL_USER;
-const GMAIL_PASS = process.env.EMAIL_PASS;
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const PORT = process.env.PORT || 3001;
@@ -20,7 +19,7 @@ const FRONTEND_URL = process.env.FRONTEND_URL || '*';
 
 const app = express();
 
-// Middleware - CORS configuration for Vercel frontend
+// Middleware
 const corsOptions = {
   origin: FRONTEND_URL === '*' ? '*' : [FRONTEND_URL, 'http://localhost:5173'],
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -30,7 +29,7 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.use(express.json());
 
-// Initialize Supabase with Service Role Key
+// Initialize Supabase
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
   auth: {
     persistSession: false,
@@ -38,15 +37,8 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
   }
 });
 
-// Initialize Gmail transporter
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: GMAIL_USER,
-    pass: GMAIL_PASS,
-  }
-});
-
+// Initialize Resend
+const resend = new Resend(RESEND_API_KEY);
 
 // =========================================================
 // === EMAIL TEMPLATES =====================================
@@ -132,7 +124,6 @@ ${yourPhone}`
   }
 };
 
-
 // =========================================================
 // === UTILITY FUNCTIONS ===================================
 // =========================================================
@@ -142,15 +133,19 @@ async function logEmail(lead, template, status) {
     ? `${lead.firstName} ${lead.lastName}` 
     : lead.name || lead.email;
   
-  await supabase.from('email_log').insert({
-    email: lead.email,
-    name: name,
-    address: lead.address || 'N/A',
-    type: lead.type || 'N/A',
-    subject: template.subject,
-    sent_at: new Date().toISOString(),
-    status: status
-  });
+  try {
+    await supabase.from('email_log').insert({
+      email: lead.email,
+      name: name,
+      address: lead.address || 'N/A',
+      type: lead.type || 'N/A',
+      subject: template.subject,
+      sent_at: new Date().toISOString(),
+      status: status
+    });
+  } catch (err) {
+    console.error('Error logging email:', err);
+  }
 }
 
 async function sendEmail(lead, config) {
@@ -159,20 +154,28 @@ async function sendEmail(lead, config) {
   
   const body = template.body(
     firstName,
-    lead.address,
+    lead.address || 'your property',
     config.yourName,
     config.yourCompany,
     config.yourPhone
   );
 
   try {
-    await transporter.sendMail({
-      from: `${config.yourName} <${GMAIL_USER}>`,
+    // Send email using Resend
+    const { data, error } = await resend.emails.send({
+      from: `${config.yourName} <onboarding@resend.dev>`, // Use your verified domain later
       to: lead.email,
       subject: template.subject,
       text: body
     });
 
+    if (error) {
+      console.error('Resend error:', error);
+      await logEmail(lead, template, 'failed');
+      return { success: false, email: lead.email, error: error.message };
+    }
+
+    console.log('Email sent successfully:', data);
     await logEmail(lead, template, 'sent');
     return { success: true, email: lead.email };
   } catch (error) {
@@ -182,27 +185,29 @@ async function sendEmail(lead, config) {
   }
 }
 
-
 // =========================================================
 // === API ROUTES ==========================================
 // =========================================================
 
 // Health check
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', message: 'CRM Backend running', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', message: 'CRM Backend running with Resend', timestamp: new Date().toISOString() });
 });
 
 // Test email connection
 app.get('/api/test-email', async (req, res) => {
   try {
-    await transporter.verify();
-    res.json({ success: true, message: 'Gmail connection successful' });
+    // Just verify the API key is set
+    if (!RESEND_API_KEY) {
+      throw new Error('RESEND_API_KEY not configured');
+    }
+    res.json({ success: true, message: 'Resend API configured' });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// GET all leads/contacts
+// GET all contacts
 app.get('/api/contacts', async (req, res) => {
   const { data, error } = await supabase
     .from('leads')
@@ -232,17 +237,19 @@ app.get('/api/contacts/:id', async (req, res) => {
 
 // POST create new contact
 app.post('/api/contacts', async (req, res) => {
+  const contactData = {
+    ...req.body,
+    created_at: new Date().toISOString()
+  };
+  
   const { data: newLead, error } = await supabase
     .from('leads')
-    .insert({
-      ...req.body,
-      created_at: new Date().toISOString()
-    })
+    .insert(contactData)
     .select();
 
   if (error) {
     console.error('Supabase insert error:', error);
-    return res.status(500).json({ error: 'Failed to add contact' });
+    return res.status(500).json({ error: 'Failed to add contact: ' + error.message });
   }
   res.status(201).json(newLead[0]);
 });
@@ -292,9 +299,9 @@ app.post('/api/contacts/:id/send-email', async (req, res) => {
   }
 
   const config = {
-    yourName: yourName || 'Chris Bennett',
-    yourCompany: yourCompany || 'CHBS Holdings LLC',
-    yourPhone: yourPhone || '555-123-4567'
+    yourName: yourName || 'Dylan Bennett',
+    yourCompany: yourCompany || 'ABC Real Estate',
+    yourPhone: yourPhone || '(302) 922-4238'
   };
 
   const result = await sendEmail(lead, config);
@@ -324,16 +331,15 @@ app.get('/api/email-logs', async (req, res) => {
   res.json(data || []);
 });
 
-
 // =========================================================
 // === AUTOMATED EMAIL SENDER (Cron Job) ===================
 // =========================================================
 
 async function runAutomatedEmailSender() {
   const config = {
-    yourName: process.env.SENDER_NAME || "Chris Bennett",
-    yourCompany: process.env.SENDER_COMPANY || "CHBS Holdings LLC",
-    yourPhone: process.env.SENDER_PHONE || "555-123-4567"
+    yourName: process.env.SENDER_NAME || "Dylan Bennett",
+    yourCompany: process.env.SENDER_COMPANY || "ABC Real Estate",
+    yourPhone: process.env.SENDER_PHONE || "(302) 922-4238"
   };
 
   console.log(`\n[AUTOMATION] Running scheduled email job at ${new Date().toLocaleTimeString()}`);
@@ -372,8 +378,8 @@ async function runAutomatedEmailSender() {
       failed++;
     }
     
-    // Wait 5 seconds between emails
-    await new Promise(resolve => setTimeout(resolve, 5000));
+    // Wait 1 second between emails
+    await new Promise(resolve => setTimeout(resolve, 1000));
   }
   
   console.log(`[AUTOMATION] Complete. Sent: ${sent}, Failed: ${failed}\n`);
@@ -387,7 +393,6 @@ cron.schedule('0 7 * * *', runAutomatedEmailSender, {
 
 console.log('Automated Email Sender scheduled: daily at 7:00 AM Eastern');
 
-
 // =========================================================
 // === START SERVER ========================================
 // =========================================================
@@ -395,6 +400,6 @@ console.log('Automated Email Sender scheduled: daily at 7:00 AM Eastern');
 app.listen(PORT, () => {
   console.log(`\n╔═══════════════════════════════════════════════╗`);
   console.log(`║   CRM Backend running on port ${PORT}            ║`);
-  console.log(`║   Health: http://localhost:${PORT}/api/health    ║`);
+  console.log(`║   Using Resend for email delivery             ║`);
   console.log(`╚═══════════════════════════════════════════════╝\n`);
 });
